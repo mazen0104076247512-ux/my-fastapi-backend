@@ -2,9 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import uuid, time
-
-from . import models, schemas, database
-from passlib.context import CryptContext # هذا يبقى كما هو
+from app import models, schemas, database
 
 # إنشاء جداول قاعدة البيانات إذا لم تكن موجودة
 models.Base.metadata.create_all(bind=database.engine)
@@ -15,6 +13,7 @@ app = FastAPI()
 # نفس الإعدادات الموجودة في ملف db_connect.php
 origins = [
     "https://ahmed-hussein-bs.netlify.app",
+    "https://your-frontend-app.com", # أضف رابط الواجهة الأمامية بعد النشر
     "http://localhost",
     "http://127.0.0.1",
     "http://127.0.0.1:5500", # For local development with VS Code Live Server
@@ -29,17 +28,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# لإدارة كلمات المرور
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str):
-    # Truncate to 72 bytes to avoid bcrypt limitation
-    return pwd_context.hash(password.encode('utf-8')[:72])
-
-def verify_password(plain_password: str, hashed_password: str):
-    # Truncate to 72 bytes to match the hashing logic
-    return pwd_context.verify(plain_password.encode('utf-8')[:72], hashed_password)
 
 # دالة للحصول على جلسة قاعدة البيانات
 def get_db():
@@ -58,7 +46,7 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
     """
     user = db.query(models.User).filter(models.User.email == user_credentials.email).first()
     
-    if not user or not verify_password(user_credentials.password, user.password):
+    if not user or not models.verify_password(user_credentials.password, user.password):
         raise HTTPException(
             status_code=401, # Unauthorized
             detail={"status": "error", "message": "خطأ في البريد الإلكتروني أو كلمة السر."},
@@ -69,7 +57,7 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
     
     return {"status": "success", "user": user}
 
-@app.post("/api/register")
+@app.post("/api/register", response_model=schemas.RegisterResponse)
 def register(student_data: schemas.StudentRegister, db: Session = Depends(get_db)):
     """
     يحل محل ملف register.php
@@ -82,7 +70,7 @@ def register(student_data: schemas.StudentRegister, db: Session = Depends(get_db
         id=str(uuid.uuid4()),
         name=student_data.name,
         email=student_data.email,
-        password=hash_password(student_data.password),
+                password=models.hash_password(student_data.password),
         class_=student_data.class_,
         role='student'
     )
@@ -90,8 +78,8 @@ def register(student_data: schemas.StudentRegister, db: Session = Depends(get_db
     db.commit()
     db.refresh(new_user)
     
-    # Convert to Pydantic model to ensure proper serialization
-    user_response = schemas.User.from_orm(new_user)
+    # Convert to Pydantic model to ensure proper serialization.
+    user_response = schemas.User.model_validate(new_user)
     return {"status": "success", "message": "تم إنشاء حسابك بنجاح! يمكنك الآن تسجيل الدخول.", "user": user_response}
 
 @app.get("/api/load_data")
@@ -100,15 +88,29 @@ def load_data(db: Session = Depends(get_db)):
     يحل محل ملف load_data.php (نسخة مبسطة)
     """
     try:
+        # تحويل جداول الطلاب إلى قاموس منظم
+        student_schedules_query = db.query(models.StudentSchedule).all()
+        student_schedules_dict = {}
+        for ss in student_schedules_query:
+            if ss.studentId not in student_schedules_dict:
+                student_schedules_dict[ss.studentId] = {}
+            if ss.day not in student_schedules_dict[ss.studentId]:
+                student_schedules_dict[ss.studentId][ss.day] = []
+            student_schedules_dict[ss.studentId][ss.day].append(schemas.StudentScheduleEntry.from_orm(ss).dict())
+
         data = {
             'users': db.query(models.User).all(),
             'lessons': db.query(models.Lesson).all(),
             'modules': db.query(models.Module).all(),
             'exams': db.query(models.Exam).all(),
             'results': db.query(models.Result).all(),
-            'groups': [], # Group model is not defined yet
-            'notifications': [], 'studentSchedules': {}, 'settings': {}, 
-            'activityLog': {}, 'favorites': {},
+            'schedules': {}, # سيتم التعامل معها لاحقاً
+            'studentSchedules': student_schedules_dict, # جلب جداول الطلاب الخاصة
+            'groups': [], # سيتم التعامل معها لاحقاً
+            'notifications': [], # سيتم التعامل معها لاحقاً
+            'favorites': {}, # سيتم التعامل معها لاحقاً
+            'settings': {}, # سيتم التعامل معها لاحقاً
+            'activityLog': {}, # سيتم التعامل معها لاحقاً
         }
         return data
     except Exception as e:
@@ -260,15 +262,15 @@ def save_student(student_data: schemas.StudentSave, db: Session = Depends(get_db
             db_student.name = student_data.name
             db_student.email = student_data.email
             db_student.class_ = student_data.class_
-            if student_data.password:
-                db_student.password = hash_password(student_data.password)
+            if student_data.password: # كلمة المرور اختيارية عند التعديل
+                db_student.password = models.hash_password(student_data.password)
             message = "تم تحديث بيانات الطالب"
         else:
             new_student = models.User(
                 id=str(uuid.uuid4()),
                 name=student_data.name,
                 email=student_data.email,
-                password=hash_password(student_data.password),
+                password=models.User.hash_password(student_data.password),
                 class_=student_data.class_,
                 role='student'
             )
@@ -333,3 +335,56 @@ def get_lesson_slides(id: str, db: Session = Depends(get_db)):
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
     return lesson.slides
+
+@app.post("/api/save_student_schedule")
+def save_student_schedule(entry_data: schemas.StudentScheduleSave, db: Session = Depends(get_db)):
+    try:
+        # Check if an entry for this student, day, and time already exists
+        db_entry = db.query(models.StudentSchedule).filter(
+            models.StudentSchedule.studentId == entry_data.studentId,
+            models.StudentSchedule.day == entry_data.day,
+            models.StudentSchedule.time == entry_data.time
+        ).first()
+
+        if db_entry:
+            # Update existing entry
+            db_entry.subject = entry_data.subject
+            db_entry.teacher = entry_data.teacher
+            message = "تم تحديث الحصة بنجاح"
+        else:
+            # Create new entry
+            new_entry = models.StudentSchedule(**entry_data.dict())
+            db.add(new_entry)
+            message = "تم حفظ الحصة بنجاح"
+        
+        db.commit()
+        return {"status": "success", "message": message}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not save schedule entry: {str(e)}")
+
+@app.post("/api/delete_student_schedule")
+def delete_student_schedule(item: schemas.StudentScheduleSave, db: Session = Depends(get_db)):
+    try:
+        db_entry = db.query(models.StudentSchedule).filter_by(studentId=item.studentId, day=item.day, time=item.time).first()
+        if not db_entry: raise HTTPException(status_code=404, detail="Schedule entry not found")
+        db.delete(db_entry)
+        db.commit()
+        return {"status": "success", "message": "تم حذف الحصة بنجاح"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not delete schedule entry: {str(e)}")
+
+@app.post("/api/update_password")
+def update_password(update_data: schemas.PasswordUpdate, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == update_data.userId).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    try:
+        user.password = models.User.hash_password(update_data.newPassword)
+        db.commit()
+        return {"status": "success", "message": "تم تحديث كلمة المرور بنجاح."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not update password: {str(e)}")
